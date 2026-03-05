@@ -1,45 +1,13 @@
 # COS → Langflow Auto-Trigger Setup
 
-## Quick Start (Automated)
-
-**TL;DR:** Configure your environment and run the setup script:
-
-```bash
-# 1. Copy the example environment file
-cp .env.example .env
-
-# 2. Edit .env with your actual values
-nano .env  # or use your preferred editor
-
-# 3. Run the setup script
-./setup.sh
-```
-
-This will automatically:
-- Install required IBM Cloud CLI plugins
-- Create Event Notifications instance
-- Enable activity tracking on your COS bucket
-- Deploy the Code Engine function
-- Configure topics, destinations, and subscriptions
-
-To remove everything:
-
-```bash
-./teardown.sh
-```
-
-> **Security Note:** The `.env` file contains sensitive credentials and is excluded from git via [`.gitignore`](.gitignore). Never commit this file to version control.
-
-For manual step-by-step setup, see the detailed instructions below.
-
----
+Automatically trigger a Langflow flow whenever a file is uploaded to an IBM Cloud Object Storage bucket.
 
 ## Architecture
 
 ```mermaid
 flowchart LR
-    A[📦 IBM COS Bucket\nfile uploaded] -->|object.create event| B[IBM Event\nNotifications]
-    B -->|webhook POST| C[Code Engine\nFunction\ncos-langflow-trigger]
+    A[📦 IBM COS Bucket\nfile uploaded] -->|write event| B[Code Engine\nSubscription]
+    B -->|POST /| C[Code Engine\nApp\ncos-langflow-app]
     C -->|POST /api/v1/run/flow-id| D[Langflow\nFlow API]
     D -->|downloads & processes| E[📄 Processed\nDocument]
 
@@ -50,419 +18,286 @@ flowchart LR
     style E fill:#198038,color:#fff
 ```
 
-## Solution Flow
-
 ```mermaid
 sequenceDiagram
     actor User
     participant COS as IBM COS Bucket
-    participant EN as IBM Event Notifications
-    participant CE as Code Engine Function
+    participant CE as Code Engine Subscription
+    participant APP as Code Engine App
     participant LF as Langflow API
     participant DOC as Document Store
 
     User->>COS: Upload file (e.g. report.pdf)
-    COS-->>EN: Emit object.create event<br/>{bucket, object_name, ...}
-    EN->>EN: Match topic filter<br/>(cloud-object-storage.object.create)
-    EN->>CE: POST webhook<br/>with COS event payload
-    CE->>CE: Extract object_key<br/>from notification
-    CE->>LF: POST /api/v1/run/<flow-id><br/>tweaks: {IBMCOSFile: {cos_object_key}}
+    COS-->>CE: Emit write event
+    CE->>APP: POST /<br/>{bucket, key, operation}
+    APP->>APP: Extract object key<br/>from event payload
+    APP->>LF: POST /api/v1/run/<flow-id><br/>tweaks: {IBMCOSFile: {cos_object_key}}
     LF->>COS: Download file by key
     COS-->>LF: Return file bytes
     LF->>LF: Run pipeline<br/>(parse → chunk → embed)
     LF->>DOC: Store vectors / results
-    LF-->>CE: 200 OK
-    CE-->>EN: 200 OK
+    LF-->>APP: 200 OK
+    APP-->>CE: 200 OK
 ```
 
 ---
 
-## Step 1: Prepare Your Langflow Flow
+## Prerequisites
 
+Before running the setup script, make sure you have:
+
+- **IBM Cloud account** with permissions to create Code Engine projects and Object Storage buckets
+- **IBM Cloud CLI** installed — [install guide](https://cloud.ibm.com/docs/cli?topic=cli-install-ibmcloud-cli)
+- **An existing COS bucket** with files you want to process
+- **A running Langflow instance** with a flow that includes an IBM COS File component
+- **Python 3** installed locally (used by the setup script for JSON parsing)
+
+Log in to IBM Cloud before running setup:
+
+```bash
+ibmcloud login --sso
+# or with API key:
+ibmcloud login --apikey YOUR_API_KEY
+```
+
+---
+
+## Quick Start
+
+```bash
+# 1. Copy the example environment file
+cp .env.example .env
+
+# 2. Edit .env with your actual values (see Configuration section below)
+nano .env
+
+# 3. Run the setup script
+./setup.sh
+```
+
+To remove all created resources:
+
+```bash
+./teardown.sh
+```
+
+---
+
+## Configuration
+
+All configuration lives in a `.env` file. Copy the example and fill in each value:
+
+```bash
+cp .env.example .env
+```
+
+> **Security Note:** `.env` contains sensitive credentials and is excluded from git via `.gitignore`. Never commit it.
+
+### Variable Reference
+
+#### Langflow
+
+| Variable | Required | Description |
+|---|---|---|
+| `LANGFLOW_URL` | Yes | Full URL of your Langflow flow's API endpoint |
+| `LANGFLOW_API_KEY` | Yes | Langflow API key for authentication |
+| `COS_COMPONENT_ID` | Yes | ID of the IBM COS File component in your flow |
+
+**How to find `LANGFLOW_URL`:**
 1. Open your flow in Langflow
-2. Click the **API** button
-3. Note your endpoint:
+2. Click the **API** button (top right)
+3. Copy the endpoint — it looks like:
    ```
-   POST https://<your-langflow-host>/api/v1/run/<flow-id>
-   ```
-4. Go to **Settings → API Keys** and copy your API key
-5. Add these values to your `.env` file:
-   ```bash
-   LANGFLOW_URL=https://your-langflow-host/api/v1/run/your-flow-id?stream=false
-   LANGFLOW_API_KEY=your-api-key
+   https://your-langflow-host/api/v1/run/abc123?stream=false
    ```
 
----
+**How to find `LANGFLOW_API_KEY`:**
+1. In Langflow, go to **Settings → API Keys**
+2. Create or copy an existing key
 
-## Step 2: Create the Code Engine Function
-
-### 2a. Create project
-
-```bash
-ibmcloud plugin install code-engine
-ibmcloud ce project create --name langflow-triggers
-ibmcloud ce project select --name langflow-triggers
-```
-
-### 2b. Write the function (`main.py`)
-
-```python
-import os
-import requests
-
-def main(params):
-    notification = params.get("data", {}).get("notification", {})
-    object_key   = notification.get("object_name", "")
-    bucket       = notification.get("bucket_name", "")
-
-    if not object_key or object_key.endswith("/"):
-        return {"status": "skipped", "reason": "directory marker or empty key"}
-
-    langflow_url     = os.environ["LANGFLOW_URL"]
-    langflow_api_key = os.environ["LANGFLOW_API_KEY"]
-    component_id     = os.environ.get("COS_COMPONENT_ID", "IBMCOSFile")
-
-    payload = {
-        "input_value": f"New file uploaded: {object_key}",
-        "tweaks": {
-            component_id: {
-                "cos_object_key": object_key
-            }
-        }
-    }
-
-    resp = requests.post(
-        langflow_url,
-        json=payload,
-        headers={
-            "x-api-key": langflow_api_key,
-            "Content-Type": "application/json"
-        },
-        timeout=30
-    )
-
-    return {
-        "status": "triggered",
-        "object_key": object_key,
-        "bucket": bucket,
-        "langflow_status": resp.status_code
-    }
-```
-
-### 2c. Deploy the function
+**How to find `COS_COMPONENT_ID`:**
+1. In Langflow, click on your IBM COS File component
+2. The component ID is shown in the component header (e.g. `IBMCOSFile`)
+3. If you have multiple COS components, each has a unique ID like `IBMCOSFile-1`, `IBMCOSFile-2`
 
 ```bash
-ibmcloud ce fn create \
-  --name cos-langflow-trigger \
-  --runtime python-3.12 \
-  --build-source . \
-  --env LANGFLOW_URL="http://169.61.49.180/api/v1/run/bfb6f30f-7d32-41c5-8f35-ceaf5e92954a?stream=false" \
-  --env LANGFLOW_API_KEY="sk-kuTuloaUuT2oBIDTa-RqQc_kqbCTBimWXPdm7BTUPdE" \
-  --env COS_COMPONENT_ID="IBMCOSFile"
-```
-
-Note the function URL from the output:
-```
-https://cos-langflow-trigger.<region>.codeengine.appdomain.cloud
+LANGFLOW_URL=https://your-langflow-host/api/v1/run/your-flow-id?stream=false
+LANGFLOW_API_KEY=sk-your-api-key
+COS_COMPONENT_ID=IBMCOSFile
 ```
 
 ---
 
-## Step 3: Create IBM Event Notifications Instance
+#### IBM Cloud Object Storage
+
+| Variable | Required | Description |
+|---|---|---|
+| `COS_BUCKET_NAME` | Yes | Name of your existing COS bucket |
+| `COS_REGION` | Yes | Region where the bucket is located |
+
+**How to find `COS_BUCKET_NAME`:**
 
 ```bash
-ibmcloud resource service-instance-create event-notifications-langflow \
-  event-notifications lite us-south
+ibmcloud cos buckets
 ```
 
-Or via console: **IBM Cloud Catalog → Event Notifications → Create (Lite plan)**
-
----
-
-## Step 4: Enable Activity Tracking on Your COS Bucket
-
-> **Note:** The `ibmcloud cos` CLI plugin (v1.10.5, latest) does **not** include a `bucket-activity-tracking-put` command. Use the IBM Cloud Resource Configuration REST API directly via `curl` instead.
-
-> **Constraint:** IBM COS requires `management_events: true` whenever an `activity_tracker_crn` is specified. You cannot set `write_data_events` without also enabling `management_events`.
+**How to find `COS_REGION`:**
 
 ```bash
-# 1. Obtain an IAM bearer token
-IAM_TOKEN=$(ibmcloud iam oauth-tokens | grep "IAM token" | awk '{print $4}')
-
-# 2. PATCH the bucket configuration
-curl -X PATCH \
-  "https://config.cloud-object-storage.cloud.ibm.com/v1/b/<your-bucket-name>" \
-  -H "Authorization: Bearer ${IAM_TOKEN}" \
-  -H "Content-Type: application/json" \
-  -d '{
-    "activity_tracking": {
-      "activity_tracker_crn": "<your-event-notifications-crn>",
-      "write_data_events": true,
-      "management_events": true
-    }
-  }'
-
-# 3. Verify the configuration was applied (expect 200 with activity_tracking block)
-curl -s \
-  "https://config.cloud-object-storage.cloud.ibm.com/v1/b/<your-bucket-name>" \
-  -H "Authorization: Bearer ${IAM_TOKEN}" | python3 -m json.tool
+ibmcloud cos bucket-location-get --bucket YOUR_BUCKET_NAME
+# Look for the "Region:" field in the output
 ```
 
-> Get the Event Notifications CRN from your instance dashboard under **Details**.
-> A successful PATCH returns an empty `204 No Content` response.
+Common region values: `us-south`, `us-east`, `eu-gb`, `eu-de`, `jp-tok`, `au-syd`
 
----
-
-## Step 5: Create Topic in Event Notifications
+> **Important:** The Code Engine project is created in the same region as the bucket. This is required — IBM Code Engine COS subscriptions only work when both are in the same region.
 
 ```bash
-# Install the Event Notifications plugin (once)
-ibmcloud plugin install event-notifications
-
-# Derive EN_INSTANCE_ID, RLE_SOURCE_ID, and COS_BUCKET_CRN in one step
-BUCKET_NAME="<your-bucket-name>"
-IAM_TOKEN=$(ibmcloud iam oauth-tokens | grep "IAM token" | awk '{print $4}')
-
-ENV_VARS=$(python3 - <<EOF
-import subprocess, json, re, urllib.request
-
-# --- Event Notifications instance ---
-result = subprocess.run(
-    ["ibmcloud", "resource", "service-instances", "--service-name", "event-notifications", "--output", "json"],
-    capture_output=True, text=True
-)
-instances = json.loads(result.stdout)
-i = instances[0]  # change index if you have multiple EN instances
-crn = i["crn"]
-guid = i["guid"]
-account_id = re.search(r":a/([^:]+):", crn).group(1)
-rle_source_id = f"crn:v1:bluemix:public:resource-lifecycle-events:global:a/{account_id}:{guid}::"
-
-# --- COS bucket CRN via Resource Configuration API ---
-import os
-iam_token = os.environ["IAM_TOKEN"]
-req = urllib.request.Request(
-    f"https://config.cloud-object-storage.cloud.ibm.com/v1/b/$BUCKET_NAME",
-    headers={"Authorization": f"Bearer {iam_token}"}
-)
-with urllib.request.urlopen(req) as resp:
-    bucket_crn = json.loads(resp.read())["crn"]
-
-print(f"EN_INSTANCE_ID={guid}")
-print(f"RLE_SOURCE_ID={rle_source_id}")
-print(f"COS_BUCKET_CRN={bucket_crn}")
-EOF
-)
-eval "$ENV_VARS"
-echo "EN_INSTANCE_ID = $EN_INSTANCE_ID"
-echo "RLE_SOURCE_ID  = $RLE_SOURCE_ID"
-echo "COS_BUCKET_CRN = $COS_BUCKET_CRN"
-
-# Set the working instance
-ibmcloud event-notifications init --instance-id "$EN_INSTANCE_ID"
-
-# Enable the IBM Cloud Resource Lifecycle Events source (required for COS events)
-ibmcloud event-notifications source-update \
-  --instance-id "$EN_INSTANCE_ID" \
-  --id "$RLE_SOURCE_ID" \
-  --enabled=true
-
-# Create the topic (or update it if it already exists)
-TOPIC_ID=$(ibmcloud event-notifications topics --instance-id "$EN_INSTANCE_ID" --output json \
-  | python3 -c "import sys,json; t=[x for x in json.load(sys.stdin)['topics'] if x['name']=='New COS Files']; print(t[0]['id'] if t else '')")
-
-SOURCES_JSON="[{
-  \"id\": \"${RLE_SOURCE_ID}\",
-  \"rules\": [{
-    \"enabled\": true,
-    \"event_type_filter\": \"\$.notification_event_info.event_type == 'cloud-object-storage.object.create'\",
-    \"notification_filter\": \"\$.notification.resources[0].crn == '${COS_BUCKET_CRN}'\"
-  }]
-}]"
-
-if [ -z "$TOPIC_ID" ]; then
-  # Topic does not exist — create it
-  ibmcloud event-notifications topic-create \
-    --instance-id "$EN_INSTANCE_ID" \
-    --name "New COS Files" \
-    --description "Triggers on new object uploads to COS bucket" \
-    --sources "$SOURCES_JSON"
-else
-  # Topic already exists — update it
-  echo "Topic already exists (id: $TOPIC_ID), updating..."
-  ibmcloud event-notifications topic-replace \
-    --instance-id "$EN_INSTANCE_ID" \
-    --id "$TOPIC_ID" \
-    --name "New COS Files" \
-    --description "Triggers on new object uploads to COS bucket" \
-    --sources "$SOURCES_JSON"
-fi
-```
-
-> **Note:** The `notification_filter` scopes events to a specific bucket. Omit it to receive events from all COS buckets in the account.
-
----
-
-## Step 6: Create Webhook Destination
-
-```bash
-CE_FUNCTION_URL="https://cos-langflow-trigger.us-south.codeengine.appdomain.cloud"
-
-ibmcloud event-notifications destination-create \
-  --instance-id "$EN_INSTANCE_ID" \
-  --name "Langflow Trigger Webhook" \
-  --type webhook \
-  --config "{
-    \"params\": {
-      \"url\": \"${CE_FUNCTION_URL}\",
-      \"verb\": \"post\",
-      \"custom_headers\": {\"Content-Type\": \"application/json\"},
-      \"sensitive_headers\": []
-    }
-  }"
-```
-
-> Note the `id` from the output — you'll need it in Step 7.
-
----
-
-## Step 7: Create Subscription
-
-```bash
-TOPIC_ID="<topic-id-from-step-5-output>"
-DESTINATION_ID="<destination-id-from-step-6-output>"
-
-ibmcloud event-notifications subscription-create \
-  --instance-id "$EN_INSTANCE_ID" \
-  --name "COS to Langflow" \
-  --topic-id "$TOPIC_ID" \
-  --destination-id "$DESTINATION_ID"
+COS_BUCKET_NAME=my-documents-bucket
+COS_REGION=us-south
 ```
 
 ---
 
-## Step 8: Test the Pipeline
+#### Code Engine
 
-> **📖 For comprehensive testing and troubleshooting, see [`TESTING.md`](TESTING.md)**
+| Variable | Required | Description |
+|---|---|---|
+| `CE_PROJECT_NAME` | Yes | Name for the Code Engine project (created if it doesn't exist) |
+| `CE_APP_NAME` | Yes | Name for the Code Engine app (created if it doesn't exist) |
 
-Upload a test file to your bucket:
+These are just names — choose anything descriptive. If a project or app with that name already exists in `COS_REGION`, it will be reused.
 
 ```bash
-# Note: Specify --region if your bucket is in a specific region or uses smart tier
+CE_PROJECT_NAME=langflow-triggers
+CE_APP_NAME=cos-langflow-app
+```
+
+---
+
+### Complete `.env` Example
+
+```bash
+# Langflow
+LANGFLOW_URL=https://169.61.49.180/api/v1/run/bfb6f30f-7d32-41c5-8f35-ceaf5e92954a?stream=false
+LANGFLOW_API_KEY=sk-kuTuloaUuT2oBIDTa-RqQc_kqbCTBimWXPdm7BTUPdE
+COS_COMPONENT_ID=IBMCOSFile
+
+# COS
+COS_BUCKET_NAME=my-documents-bucket
+COS_REGION=us-south
+
+# Code Engine
+CE_PROJECT_NAME=langflow-triggers
+CE_APP_NAME=cos-langflow-app
+```
+
+---
+
+## Running the Setup
+
+```bash
+./setup.sh
+```
+
+The script will:
+
+1. **Install plugins** — installs the `code-engine` and `cloud-object-storage` IBM Cloud CLI plugins if not already installed
+2. **Create Code Engine project** — creates a CE project in `COS_REGION` (or reuses an existing one)
+3. **Deploy the app** — builds and deploys `app.py` + `main.py` as a Code Engine app that scales to zero when idle
+4. **Create IAM authorization** — grants the CE project permission to configure COS bucket notifications
+5. **Create COS subscription** — wires the COS bucket to the app so every file write triggers a POST
+
+When complete, the output includes a summary:
+
+```
+==========================================
+✓ Setup Complete!
+==========================================
+
+Configuration Summary:
+  COS Bucket:    my-documents-bucket (region: us-south)
+  CE Project:    langflow-triggers (2321b9ce-...)
+  CE App:        cos-langflow-app
+  App URL:       https://cos-langflow-app.xxx.us-south.codeengine.appdomain.cloud
+  Subscription:  cos-langflow-app-cos-sub
+```
+
+---
+
+## Testing
+
+### 1. Upload a file to trigger the pipeline
+
+```bash
 ibmcloud cos object-put \
-  --bucket <your-bucket-name> \
-  --key test/sample.pdf \
-  --body ./sample.pdf \
-  --region us-south
+  --bucket YOUR_BUCKET_NAME \
+  --key path/to/your-file.pdf \
+  --body ./your-file.pdf \
+  --region YOUR_REGION
 ```
 
-Then verify the function was triggered:
+### 2. Watch the app logs to confirm it was triggered
 
 ```bash
-# Check function details and recent invocations
-ibmcloud ce function get --name cos-langflow-trigger
-
-# Or invoke the function directly to test
-curl -X POST https://cos-langflow-trigger.<region>.codeengine.appdomain.cloud \
-  -H "Content-Type: application/json" \
-  -d '{
-    "data": {
-      "notification": {
-        "object_name": "test/sample.pdf",
-        "bucket_name": "prudential-langflow"
-      }
-    }
-  }'
+ibmcloud ce app logs --name cos-langflow-app --follow
 ```
 
-> **Note:** Code Engine function logs are available through IBM Cloud Logging. To view detailed logs, configure logging for your Code Engine project in the IBM Cloud console.
+You should see output like:
+
+```
+=== Incoming params ===
+{ "bucket": "my-documents-bucket", "key": "path/to/your-file.pdf", "operation": "write" }
+Detected Format 4: Code Engine COS subscription
+Calling Langflow: https://...
+Langflow response status: 200
+```
+
+### 3. Test the app directly (without uploading a file)
+
+```bash
+APP_URL=$(ibmcloud ce app get --name cos-langflow-app | awk '/^URL:/{print $2}')
+
+curl -s -X POST "$APP_URL" \
+  -H "Content-Type: application/json" \
+  -d '{"bucket":"YOUR_BUCKET_NAME","key":"path/to/existing-file.pdf"}' \
+  | python3 -m json.tool
+```
+
+A successful response looks like:
+
+```json
+{
+    "status": "triggered",
+    "object_key": "path/to/existing-file.pdf",
+    "bucket": "my-documents-bucket",
+    "langflow_status": 200,
+    "langflow_response": "..."
+}
+```
+
+---
+
+## Teardown
+
+```bash
+./teardown.sh
+```
+
+This removes:
+- The COS event subscription
+- The Code Engine app
+- Optionally the Code Engine project (you will be prompted)
+- The IAM authorization policy
 
 ---
 
 ## Summary
 
-| Step | Where | What |
-|------|-------|-------|
-| 1 | Langflow | Copy flow API URL + API key |
-| 2 | Code Engine | Deploy trigger function |
-| 3 | IBM Cloud | Create Event Notifications instance |
-| 4 | COS Bucket | Enable activity tracking → Event Notifications |
-| 5 | Event Notifications | Create topic filtering `object.create` events |
-| 6 | Event Notifications | Create webhook → Code Engine function URL |
-| 7 | Event Notifications | Create subscription linking topic → webhook |
-| 8 | CLI | Upload test file and verify logs |
-
----
-
-## Teardown / Reset
-
-Run these commands in order to remove all resources and start from scratch.
-
-### 1. Delete EN subscriptions, destinations, and topics
-
-```bash
-EN_INSTANCE_ID=$(ibmcloud resource service-instances --service-name event-notifications --output json \
-  | python3 -c "import sys,json; print(json.load(sys.stdin)[0]['guid'])")
-
-# Delete all subscriptions
-ibmcloud event-notifications subscriptions --instance-id "$EN_INSTANCE_ID" --output json \
-  | python3 -c "import sys,json; [print(x['id']) for x in json.load(sys.stdin)['subscriptions']]" \
-  | xargs -I{} ibmcloud event-notifications subscription-delete --instance-id "$EN_INSTANCE_ID" --id {} -f
-
-# Delete custom webhook destinations (built-in IBM destinations cannot be deleted)
-ibmcloud event-notifications destinations --instance-id "$EN_INSTANCE_ID" --output json \
-  | python3 -c "
-import sys, json
-for d in json.load(sys.stdin)['destinations']:
-    if d['type'] == 'webhook':
-        print(d['id'])
-" \
-  | xargs -I{} ibmcloud event-notifications destination-delete --instance-id "$EN_INSTANCE_ID" --id {} -f
-
-# Delete all topics
-ibmcloud event-notifications topics --instance-id "$EN_INSTANCE_ID" --output json \
-  | python3 -c "import sys,json; [print(x['id']) for x in json.load(sys.stdin)['topics']]" \
-  | xargs -I{} ibmcloud event-notifications topic-delete --instance-id "$EN_INSTANCE_ID" --id {} -f
-
-# Disable the Resource Lifecycle Events source
-RLE_SOURCE_ID=$(ibmcloud event-notifications sources --instance-id "$EN_INSTANCE_ID" --output json \
-  | python3 -c "
-import sys, json
-for s in json.load(sys.stdin)['sources']:
-    if s['type'] == 'resource-lifecycle-events':
-        print(s['id'])
-")
-ibmcloud event-notifications source-update \
-  --instance-id "$EN_INSTANCE_ID" \
-  --id "$RLE_SOURCE_ID" \
-  --enabled=false
-```
-
-### 2. Delete the Event Notifications service instance
-
-```bash
-ibmcloud resource service-instance-delete event-notifications-langflow -f --recursive
-```
-
-### 3. Remove activity tracking from the COS bucket
-
-```bash
-BUCKET_NAME="prudential-langflow"
-IAM_TOKEN=$(ibmcloud iam oauth-tokens | grep "IAM token" | awk '{print $4}')
-
-curl -s -X PATCH \
-  "https://config.cloud-object-storage.cloud.ibm.com/v1/b/${BUCKET_NAME}" \
-  -H "Authorization: Bearer ${IAM_TOKEN}" \
-  -H "Content-Type: application/json" \
-  -d '{"activity_tracking": null}'
-```
-
-### 4. Delete the Code Engine function and project
-
-```bash
-# Delete the function
-ibmcloud ce fn delete --name cos-langflow-trigger -f
-
-# Optionally delete the entire Code Engine project
-ibmcloud ce project delete --name langflow-triggers -f --hard
-```
+| Step | What the script does |
+|------|----------------------|
+| 1 | Installs `code-engine` and `cloud-object-storage` CLI plugins |
+| 2 | Creates (or selects) a Code Engine project in the bucket's region |
+| 3 | Builds and deploys the trigger app from source |
+| 4 | Creates IAM service-to-service authorization (CE → COS) |
+| 5 | Creates a COS write-event subscription pointing to the app |

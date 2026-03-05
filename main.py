@@ -2,6 +2,14 @@ import os
 import json
 import requests
 
+def _respond(body_dict, status_code=200):
+    """Wrap a dict as a proper Code Engine Functions web action HTTP response."""
+    return {
+        "statusCode": status_code,
+        "headers": {"Content-Type": "application/json"},
+        "body": json.dumps(body_dict),
+    }
+
 def main(params):
     # Log the raw incoming payload for debugging
     print("=== Incoming params ===")
@@ -34,13 +42,23 @@ def main(params):
             notification = data
             print("Detected Format 3: Alternative EN format")
     
-    # Format 4: Top-level notification
+    # Format 4: IBM Code Engine native COS subscription
+    # CE sends: { "bucket": "...", "key": "path/to/file.pdf", "operation": "write" }
+    if not notification.get("object_name"):
+        if params.get("key"):
+            notification = {
+                "object_name": params["key"],
+                "bucket_name": params.get("bucket", ""),
+            }
+            print("Detected Format 4: Code Engine COS subscription")
+
+    # Format 5: Top-level notification
     # { "object_name": ... }
     if not notification.get("object_name"):
         if params.get("object_name"):
             notification = params
-            print("Detected Format 4: Top-level format")
-    
+            print("Detected Format 5: Top-level format")
+
     object_key = notification.get("object_name", "")
     bucket     = notification.get("bucket_name", "")
     
@@ -54,15 +72,15 @@ def main(params):
             print("notification keys:", list(params["notification"].keys()))
         if "data" in params:
             print("data keys:", list(params["data"].keys()))
-        return {
+        return _respond({
             "status": "error",
             "reason": "Could not extract object_name from payload",
             "payload_keys": list(params.keys())
-        }
+        }, 400)
     
     if object_key.endswith("/"):
         print(f"Skipping directory marker: {object_key}")
-        return {"status": "skipped", "reason": "directory marker"}
+        return _respond({"status": "skipped", "reason": "directory marker"})
     
     langflow_url     = os.environ.get("LANGFLOW_URL")
     langflow_api_key = os.environ.get("LANGFLOW_API_KEY")
@@ -70,10 +88,10 @@ def main(params):
     
     if not langflow_url or not langflow_api_key:
         print("ERROR: Missing LANGFLOW_URL or LANGFLOW_API_KEY environment variables")
-        return {
+        return _respond({
             "status": "error",
             "reason": "Missing required environment variables"
-        }
+        }, 500)
     
     print(f"Calling Langflow: {langflow_url}")
     print(f"Component ID: {component_id}")
@@ -101,20 +119,20 @@ def main(params):
         print(f"Langflow response status: {resp.status_code}")
         print(f"Langflow response: {resp.text[:500]}")  # First 500 chars
         
-        return {
+        return _respond({
             "status": "triggered",
             "object_key": object_key,
             "bucket": bucket,
             "langflow_status": resp.status_code,
-            "langflow_response": resp.text[:200]  # Truncate for response
-        }
+            "langflow_response": resp.text[:200]
+        })
     except Exception as e:
         print(f"ERROR calling Langflow: {str(e)}")
-        return {
+        return _respond({
             "status": "error",
             "reason": f"Failed to call Langflow: {str(e)}",
             "object_key": object_key,
             "bucket": bucket
-        }
+        }, 500)
 
 # Made with Bob
