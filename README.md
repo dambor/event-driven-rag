@@ -240,18 +240,22 @@ ibmcloud cos object-put \
 ### 2. Watch the app logs to confirm it was triggered
 
 ```bash
-ibmcloud ce app logs --name cos-langflow-app --follow
+# Wake the app and follow logs in one command
+APP_URL=$(ibmcloud ce app get --name cos-langflow-app | awk '/^URL:/{print $2}')
+curl -s "$APP_URL" > /dev/null & ibmcloud ce app logs --name cos-langflow-app --follow
 ```
 
 You should see output like:
 
 ```
-=== Incoming params ===
-{ "bucket": "my-documents-bucket", "key": "path/to/your-file.pdf", "operation": "write" }
-Detected Format 4: Code Engine COS subscription
-Calling Langflow: https://...
-Langflow response status: 200
+2026-03-05T22:24:54 [INFO] Incoming request from 127.0.0.1
+2026-03-05T22:24:54 [INFO] Detected Format 4: Code Engine COS subscription
+2026-03-05T22:24:54 [INFO] object_key=path/to/your-file.pdf  bucket=my-documents-bucket
+2026-03-05T22:24:54 [INFO] Calling Langflow  url=https://...  component=IBMCOSFile
+2026-03-05T22:25:07 [INFO] Langflow responded  status=200
 ```
+
+> **Note:** The app scales to zero when idle (`--min-scale 0`). If you run `--follow` without waking it first you will see "No running instances found". Either use the wake command above or see the [Logs](#logs) section to set up persistent logging.
 
 ### 3. Test the app directly (without uploading a file)
 
@@ -275,6 +279,51 @@ A successful response looks like:
     "langflow_response": "..."
 }
 ```
+
+---
+
+## Logs
+
+The app writes structured logs with timestamps and levels. To view them persistently — including past invocations after the app has scaled to zero — connect IBM Log Analysis to your Code Engine project.
+
+### Step 1 — Create an IBM Log Analysis instance
+
+1. Go to [cloud.ibm.com/catalog](https://cloud.ibm.com/catalog) and search for **Log Analysis**
+2. Click **IBM Log Analysis**
+3. Select:
+   - **Region:** same as your `COS_REGION` (e.g. `us-south`)
+   - **Plan:** `Lite` (free — 500 MB/day, 7-day retention)
+   - **Name:** e.g. `langflow-logs`
+4. Click **Create**
+
+### Step 2 — Connect it to your Code Engine project
+
+1. Go to [cloud.ibm.com/codeengine/projects](https://cloud.ibm.com/codeengine/projects)
+2. Click your project (e.g. `langflow-triggers`)
+3. In the left sidebar click **Integrations**
+4. Under **Logging**, click **Add**
+5. Select the `langflow-logs` instance and click **Select**
+
+### Step 3 — Redeploy the app to pick up the logging config
+
+```bash
+ibmcloud ce app update --name cos-langflow-app --build-source .
+```
+
+### Step 4 — Open the dashboard
+
+1. Go to [cloud.ibm.com/observe/logging](https://cloud.ibm.com/observe/logging)
+2. Click **Open Dashboard** next to `langflow-logs`
+3. Set the time range to **Last 15 minutes** (top right)
+4. Search for `cos-langflow-app` to filter to your app
+
+### Troubleshooting
+
+| Symptom | Fix |
+|---|---|
+| No logs after upload | Set the dashboard time range to "Last 15 min" |
+| Dashboard is empty | Ensure Log Analysis is in the same region as the CE project |
+| Logs appear for startup but not requests | Redeploy after connecting logging (Step 3) |
 
 ---
 
