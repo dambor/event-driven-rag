@@ -269,7 +269,7 @@ The app writes structured logs with timestamps and levels. To view them persiste
 
 ### Step 1 — Create an IBM Log Analysis instance
 
-1. Go to [cloud.ibm.com/catalog](https://cloud.ibm.com/catalog) and search for **Log Analysis**
+1. Go to [cloud.ibm.com/catalog](https://cloud.ibm.com/catalog) and search for **Cloud Logs**
 2. Click **IBM Log Analysis**
 3. Select:
    - **Region:** same as your `COS_REGION` (e.g. `us-south`)
@@ -281,9 +281,9 @@ The app writes structured logs with timestamps and levels. To view them persiste
 
 1. Go to [cloud.ibm.com/codeengine/projects](https://cloud.ibm.com/codeengine/projects)
 2. Click your project (e.g. `langflow-triggers`)
-3. In the left sidebar click **Integrations**
-4. Under **Logging**, click **Add**
-5. Select the `langflow-logs` instance and click **Select**
+3. In the left sidebar click **Project Settings** > **Integrations**
+4. Under **Actions** on the top right corner, click on **Add Logging**
+5. Select the `langflow-logs` instance and click **Create**
 
 ### Step 3 — Redeploy the app to pick up the logging config
 
@@ -293,10 +293,11 @@ ibmcloud ce app update --name cos-langflow-app --build-source .
 
 ### Step 4 — Open the dashboard
 
-1. Go to [cloud.ibm.com/observe/logging](https://cloud.ibm.com/observe/logging)
-2. Click **Open Dashboard** next to `langflow-logs`
-3. Set the time range to **Last 15 minutes** (top right)
-4. Search for `cos-langflow-app` to filter to your app
+1. Go to [cloud.ibm.com/codeengine/projects](https://cloud.ibm.com/codeengine/projects)
+2. Click on your project (e.g. `langflow-triggers`)
+3. In the right side bar, click on **Actions** > **Logging**
+4. Set the time range to **Last 15 minutes** (top right)
+
 
 ### Troubleshooting
 
