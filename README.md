@@ -1,4 +1,4 @@
-# COS → Langflow Auto-Trigger Setup
+# Event-Driven RAG with COS, Code Engine, Langflow and AstraDB
 
 Automatically trigger a Langflow flow whenever a file is uploaded to an IBM Cloud Object Storage bucket.
 
